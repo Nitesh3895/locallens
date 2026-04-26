@@ -1,0 +1,621 @@
+iPhone Backup Webapp — Complete Build Prompt
+For: Cursor / Claude / Windsurf / v0 / Any AI Code Editor
+
+PROJECT OVERVIEW
+Build a local web application (Node.js backend + modern React frontend) that:
+
+Detects and mounts an iPhone on macOS
+Detects connected external SSDs
+Lets users choose destination folders on the SSD
+Copies photos and videos from iPhone to SSD
+Tracks every file, skips already-copied files correctly, shows live progress
+Handles all interruptions, disconnections, and edge cases gracefully
+Is the first module of a larger local photo management system (like a self-hosted Google Photos)
+
+
+TECH STACK
+Backend
+
+Runtime: Node.js 20+ with TypeScript
+Framework: Fastify (faster than Express, built-in schema validation)
+iPhone mounting: libimobiledevice + ifuse + macFUSE (macOS)
+File operations: Node.js fs/promises + streams for large files
+Database: SQLite via better-sqlite3 — tracks every file ever seen/copied
+Real-time: WebSocket via ws library — live progress to frontend
+Process management: execa for running shell commands safely
+Media metadata: exiftool (via exiftool-vendored) — reads EXIF date, GPS, dimensions
+Checksums: xxhash (fast) for file integrity verification
+Queue: p-queue for controlled concurrency
+
+Frontend
+
+Framework: React 18 + Vite
+Styling: Tailwind CSS + custom CSS variables for theming
+State: Zustand for global state
+Real-time: Native WebSocket hook
+Animations: Framer Motion
+Icons: Lucide React
+Charts/progress: Custom SVG components
+Font pairing: Syne (display/headings) + DM Sans (body) from Google Fonts
+
+Design Direction
+Dark, refined, cinematic. Think: Apple's own design language but warmer — deep charcoal backgrounds (#0f0f0f, #1a1a1a), warm amber/gold accents (#f59e0b) for active states, soft white text (#f0ede8). Clean card-based layout. Subtle grain texture overlay. No gradients on backgrounds — flat dark surfaces with precise borders (1px, rgba white 8%). Progress bars use smooth animated fills. Status indicators pulse gently. The app should feel like a premium local tool, not a website.
+
+BACKEND ARCHITECTURE
+File Structure
+/server
+  /src
+    index.ts              — Fastify server entry, WebSocket setup
+    /routes
+      device.ts           — iPhone detection, mount, unmount
+      disk.ts             — SSD detection, folder listing, disk usage
+      backup.ts           — Start/pause/resume/cancel backup job
+      files.ts            — File listing, status queries
+      settings.ts         — App settings (concurrency, skip rules, etc.)
+    /services
+      iphone.service.ts   — libimobiledevice/ifuse wrapper
+      disk.service.ts     — macOS diskutil wrapper, SSD detection
+      backup.service.ts   — Core backup engine
+      db.service.ts       — SQLite operations
+      exif.service.ts     — EXIF metadata extraction
+      checksum.service.ts — File hash computation
+      ws.service.ts       — WebSocket broadcast
+    /models
+      file.model.ts       — File record schema
+      job.model.ts        — Backup job schema
+    db.ts                 — SQLite init, migrations
+    config.ts             — App config, env vars
+SQLite Schema
+sql-- Every file ever seen on the iPhone
+CREATE TABLE files (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id       TEXT NOT NULL,          -- iPhone UDID
+  relative_path   TEXT NOT NULL,          -- e.g. DCIM/100APPLE/IMG_0001.HEIC
+  filename        TEXT NOT NULL,
+  size_bytes      INTEGER NOT NULL,
+  file_modified   TEXT,                   -- ISO date from filesystem
+  exif_date       TEXT,                   -- EXIF DateTimeOriginal
+  exif_gps_lat    REAL,
+  exif_gps_lon    REAL,
+  media_type      TEXT,                   -- 'photo' | 'video' | 'unknown'
+  mime_type       TEXT,
+  width           INTEGER,
+  height          INTEGER,
+  duration_sec    REAL,                   -- for videos
+  source_hash     TEXT,                   -- xxhash of source file
+  first_seen_at   TEXT NOT NULL,
+  UNIQUE(device_id, relative_path)
+);
+
+-- Every copy operation attempted
+CREATE TABLE copy_records (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_id          INTEGER NOT NULL REFERENCES files(id),
+  job_id           INTEGER NOT NULL REFERENCES backup_jobs(id),
+  dest_path        TEXT NOT NULL,         -- full absolute destination path
+  dest_folder      TEXT NOT NULL,         -- the chosen destination folder root
+  status           TEXT NOT NULL,         -- 'pending' | 'copying' | 'done' | 'failed' | 'skipped'
+  bytes_copied     INTEGER DEFAULT 0,
+  error_message    TEXT,
+  started_at       TEXT,
+  finished_at      TEXT,
+  dest_hash        TEXT,                  -- xxhash computed after copy for verification
+  verified         INTEGER DEFAULT 0,     -- 1 if source_hash == dest_hash
+  UNIQUE(file_id, dest_folder)            -- one record per file per destination
+);
+
+-- Backup job sessions
+CREATE TABLE backup_jobs (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id        TEXT NOT NULL,
+  dest_folder      TEXT NOT NULL,
+  status           TEXT NOT NULL,         -- 'running' | 'paused' | 'completed' | 'cancelled' | 'failed'
+  total_files      INTEGER DEFAULT 0,
+  copied_files     INTEGER DEFAULT 0,
+  skipped_files    INTEGER DEFAULT 0,
+  failed_files     INTEGER DEFAULT 0,
+  total_bytes      INTEGER DEFAULT 0,
+  copied_bytes     INTEGER DEFAULT 0,
+  started_at       TEXT NOT NULL,
+  paused_at        TEXT,
+  resumed_at       TEXT,
+  finished_at      TEXT,
+  error_log        TEXT                   -- JSON array of error objects
+);
+
+CREATE INDEX idx_files_device ON files(device_id);
+CREATE INDEX idx_copy_records_job ON copy_records(job_id);
+CREATE INDEX idx_copy_records_status ON copy_records(status);
+CREATE INDEX idx_copy_records_file_dest ON copy_records(file_id, dest_folder);
+
+IPHONE DETECTION & MOUNTING (macOS)
+Prerequisites Check (run on app startup)
+1. Check if macFUSE is installed: system_profiler SPExtensionsDataType | grep macFUSE
+2. Check if ifuse is installed: which ifuse
+3. Check if ideviceinfo is installed: which ideviceinfo
+4. If any missing → show setup guide in UI with brew install commands
+Device Detection
+
+Poll idevice_id -l every 3 seconds to detect connected iPhones
+On detection: run ideviceinfo -u <UDID> to get device name, iOS version, serial
+Emit WebSocket event device:connected with device info
+On disconnect: emit device:disconnected
+
+Mounting Flow
+1. Create mount point: mkdir -p ~/VaultSync/mounts/<UDID>
+2. Check if already mounted: mount | grep <mount_point>
+3. If mounted: verify it's accessible (ls the mount point)
+4. If not mounted: run ifuse --udid <UDID> ~/VaultSync/mounts/<UDID>
+5. After mount: read DCIM folder to count total files
+6. Emit WebSocket: mount:success with { mountPath, fileCount, deviceName }
+Unmounting
+1. Wait for any active copy operations to complete current file
+2. run: umount ~/VaultSync/mounts/<UDID>  (NOT fusermount on macOS)
+3. Emit: mount:disconnected
+Error Cases for iPhone
+
+Trust not accepted → parse ifuse error, show "Unlock iPhone and tap Trust"
+Already mounted but inaccessible → auto unmount + remount
+iPhone locked during copy → pause copy, wait for unlock signal, resume
+USB cable disconnected mid-copy → detect via idevice_id -l poll, mark current file as failed, save job state, notify UI
+
+
+SSD / DISK DETECTION
+Detection Method (macOS)
+bashdiskutil list -plist external    # lists all external disks
+diskutil info -plist /dev/diskN  # details per disk
+Parse output to extract:
+
+Volume name
+Mount path
+Total size, available space
+Filesystem type (APFS, exFAT, HFS+)
+Connection type (USB, Thunderbolt — from ioreg)
+
+Folder Listing API
+GET /api/disk/folders?path=/Volumes/MySSD
+Returns: { folders: [{ name, path, itemCount, lastModified }] }
+
+List only directories, not files
+Show item count per folder (ls count, non-recursive, fast)
+Allow creating new folders from the UI
+Breadcrumb navigation for deep paths
+Default suggested path: /Volumes/<SSD Name>/iPhone Backups/<DeviceName>/
+
+
+BACKUP ENGINE — CORE LOGIC
+Pre-Backup Scan Phase
+Before copying anything:
+1. Walk the entire iPhone DCIM folder recursively
+2. For each file found:
+   a. Check files table: has this (device_id, relative_path) been seen before?
+   b. If yes AND size matches AND copy_records shows status='done' AND verified=1
+      for the chosen dest_folder → mark as SKIP candidate
+   c. If no → mark as COPY candidate
+3. Insert/update files table with current metadata
+4. Create backup_job record with total counts
+5. Emit: scan:complete { totalFiles, toSkip, toCopy, totalBytes }
+6. Wait for user confirmation before starting copy
+Skip Logic — CRITICAL
+A file should be skipped IF AND ONLY IF:
+
+files table has a record for this (device_id, relative_path) ✓
+copy_records has a record for this (file_id, dest_folder) ✓
+copy_records.status = 'done' ✓
+copy_records.verified = 1 (checksum verified) ✓
+The destination file actually exists at copy_records.dest_path ✓
+Destination file size matches files.size_bytes ✓
+
+If ALL 6 conditions are true → SKIP (safe to skip)
+If ANY condition fails → COPY (do not skip, copy again)
+This prevents the "already copied" false positive where the destination file was deleted or corrupted.
+Copy Phase
+Concurrency: configurable, default 3 parallel copy streams
+
+For each file to copy:
+1. Set copy_records.status = 'copying', started_at = now
+2. Compute destination path:
+   - Use EXIF date if available: dest_folder/YYYY/MM-MonthName/filename
+   - Fallback to file modified date: dest_folder/YYYY/MM/filename
+   - If no date at all: dest_folder/Undated/filename
+3. Check if destination file exists:
+   - If exists and same size → compute dest checksum
+   - If dest checksum == source checksum → mark as 'done' + 'verified', skip copy
+   - If dest checksum != source checksum → overwrite (corrupted dest)
+4. Create destination directory if needed
+5. Stream copy: fs.createReadStream → fs.createWriteStream
+   - Pipe through xxhash transform to compute source hash during copy
+   - Track bytes written, emit progress every 500ms via WebSocket
+6. After copy:
+   - Compute destination file hash
+   - Compare source_hash vs dest_hash
+   - If match: status='done', verified=1, finished_at=now
+   - If mismatch: status='failed', error='checksum_mismatch', delete dest file, retry once
+7. Emit: file:done or file:failed
+Folder Naming Convention
+dest_folder/
+  2024/
+    01-January/
+      IMG_0001.HEIC
+      IMG_0002.MOV
+    06-June/
+      ...
+  2025/
+    ...
+  Undated/
+    ...
+
+INTERRUPTION & RESUME HANDLING
+Pause (user-initiated)
+1. Set job.status = 'paused', paused_at = now in DB
+2. Signal copy workers to pause after current file completes
+3. Do NOT interrupt mid-file stream
+4. Emit: job:paused { copiedSoFar, remaining }
+Resume
+1. Set job.status = 'running', resumed_at = now
+2. Query copy_records WHERE job_id=X AND status='pending'
+3. Continue from where left off — pending files only
+4. Emit: job:resumed
+Cable Disconnect / iPhone Removed Mid-Copy
+1. idevice_id poll detects device gone
+2. Immediately: set current 'copying' file → status='failed', error='device_disconnected'
+3. Set job.status = 'paused' (NOT failed — it can resume)
+4. Delete the partially written destination file
+5. Emit: device:disconnected + job:paused
+6. When iPhone reconnected:
+   - Re-mount automatically
+   - Ask user: "Resume previous backup? X files remaining"
+   - On confirm → resume from pending files
+App Crash / Server Restart
+On startup: check backup_jobs WHERE status='running' or status='paused'
+If found:
+  - Set any 'copying' status files → 'pending' (they were interrupted)
+  - Delete any partially written files at those dest paths
+  - Restore job to paused state
+  - Notify user: "Previous backup session found. Resume?"
+Destination SSD Disconnects
+1. Detect via disk polling every 5s
+2. Pause copy immediately
+3. Mark current file as 'pending' (not failed)
+4. Emit: disk:disconnected
+5. When SSD reconnects: auto-detect, ask to resume
+iPhone Locks During Copy
+1. Detect: ifuse read returns EACCES or EIO
+2. Pause current file stream
+3. Emit: device:locked — show "Unlock your iPhone to continue"
+4. Retry current file when device unlocked (detected via ideviceinfo polling)
+Low Disk Space
+1. Before each file copy: check available space on destination
+2. If available < file_size + 500MB buffer:
+   - Pause job
+   - Emit: disk:lowspace { available, required }
+   - Show warning with clear GB numbers
+3. Do not start a copy that cannot fit
+
+WEBSOCKET EVENTS (Server → Client)
+typescript// Device events
+{ type: 'device:connected', payload: { udid, name, iosVersion, batteryLevel } }
+{ type: 'device:disconnected', payload: { udid } }
+{ type: 'device:locked', payload: { udid } }
+{ type: 'device:trust_required', payload: { udid } }
+{ type: 'mount:success', payload: { mountPath, dcimFileCount } }
+{ type: 'mount:failed', payload: { error } }
+
+// Disk events
+{ type: 'disk:connected', payload: { name, mountPath, totalGB, availableGB } }
+{ type: 'disk:disconnected', payload: { mountPath } }
+{ type: 'disk:lowspace', payload: { availableGB, requiredGB } }
+
+// Scan events
+{ type: 'scan:progress', payload: { scanned, total } }
+{ type: 'scan:complete', payload: { totalFiles, toCopy, toSkip, totalBytes } }
+
+// Job events
+{ type: 'job:started', payload: { jobId, totalFiles, toCopy, toSkip } }
+{ type: 'job:paused', payload: { jobId, copiedFiles, remainingFiles } }
+{ type: 'job:resumed', payload: { jobId } }
+{ type: 'job:completed', payload: { jobId, stats } }
+{ type: 'job:failed', payload: { jobId, error } }
+
+// File events (batched every 500ms to avoid flooding)
+{ type: 'file:progress', payload: { fileId, filename, bytesWritten, totalBytes, speedBps } }
+{ type: 'file:done', payload: { fileId, filename, destPath, verified } }
+{ type: 'file:skipped', payload: { fileId, filename, reason } }
+{ type: 'file:failed', payload: { fileId, filename, error, willRetry } }
+
+// Overall progress (broadcast every 1s)
+{ type: 'progress:update', payload: {
+    jobId,
+    totalFiles, copiedFiles, skippedFiles, failedFiles, pendingFiles,
+    totalBytes, copiedBytes,
+    currentSpeedBps, avgSpeedBps,
+    estimatedSecondsRemaining,
+    activeFiles: [{ filename, progress, speedBps }]  // currently copying
+  }
+}
+
+API ENDPOINTS
+GET  /api/health                    — app health, prerequisite check
+GET  /api/device                    — current iPhone state
+POST /api/device/mount              — mount iPhone
+POST /api/device/unmount            — unmount iPhone
+
+GET  /api/disks                     — list external SSDs
+GET  /api/disk/folders?path=        — list subfolders at path
+POST /api/disk/folder               — create new folder { path }
+
+POST /api/backup/scan               — scan iPhone, return file counts (no copy yet)
+POST /api/backup/start              — start backup { jobId, destFolder, options }
+POST /api/backup/pause              — pause current job
+POST /api/backup/resume             — resume paused job
+POST /api/backup/cancel             — cancel and clean up
+
+GET  /api/jobs                      — list all backup jobs
+GET  /api/jobs/:id                  — job details + file list
+GET  /api/jobs/:id/files            — paginated file list with status
+GET  /api/jobs/:id/failed           — only failed files
+POST /api/jobs/:id/retry-failed     — retry all failed files
+
+GET  /api/settings                  — get settings
+PUT  /api/settings                  — update settings
+
+GET  /api/stats                     — total stats: GB backed up, file counts, etc.
+
+SETTINGS
+typescriptinterface AppSettings {
+  concurrency: number;              // parallel copy streams, default 3
+  chunkSize: number;                // stream chunk size bytes, default 1MB
+  verifyChecksums: boolean;         // verify after copy, default true
+  folderNaming: 'by-date' | 'flat'; // default 'by-date'
+  dateSource: 'exif' | 'file';      // which date to use for folder naming
+  skipExisting: boolean;            // default true (with full verification)
+  retryFailedCount: number;         // how many times to retry failed files, default 2
+  retryDelayMs: number;             // delay between retries, default 3000
+  autoMountOnConnect: boolean;      // default true
+  autoStartBackup: boolean;         // default false (require confirmation)
+  excludePatterns: string[];        // e.g. ['.DS_Store', 'Thumbs.db']
+  includeMediaTypes: ('photo' | 'video' | 'all'); // default 'all'
+}
+
+FRONTEND UI STRUCTURE
+Layout: Single Page App with 4 sections visible on one screen (no tabs)
+┌─────────────────────────────────────────────────────┐
+│  HEADER: VaultSync logo + device status indicator   │
+├──────────────┬──────────────────────────────────────┤
+│              │                                       │
+│  LEFT PANEL  │         MAIN AREA                    │
+│  (280px)     │                                       │
+│              │  When idle: Welcome + setup guide     │
+│  • iPhone    │  When scanning: animated scan UI      │
+│    status    │  When ready: file summary + confirm   │
+│    card      │  When copying: live progress          │
+│              │  When done: summary + stats           │
+│  • SSD       │                                       │
+│    status    │                                       │
+│    card      │                                       │
+│              │                                       │
+│  • Dest      │                                       │
+│    folder    │                                       │
+│    picker    │                                       │
+│              │                                       │
+├──────────────┴──────────────────────────────────────┤
+│  BOTTOM: File activity log (scrollable, last 50)    │
+└─────────────────────────────────────────────────────┘
+Key UI States
+State 1: Setup / Prerequisites missing
+
+Show checklist: macFUSE ✓/✗, ifuse ✓/✗, ideviceinfo ✓/✗
+One-click copy of brew install command
+"Check again" button
+
+State 2: Waiting for iPhone
+
+Animated iPhone outline with pulsing USB cable illustration (CSS animation)
+"Connect your iPhone and tap Trust" message
+SSD selector available on the right
+
+State 3: iPhone connected, selecting destination
+
+iPhone card: device name, iOS version, battery %, storage used/total
+SSD card: name, available space, connection type
+Folder browser: breadcrumb + folder list + "New folder" button
+Selected destination shown prominently
+"Scan iPhone" button (primary CTA)
+
+State 4: Scanning
+
+Animated counter: files found so far (increments live)
+DCIM folder tree appearing item by item
+Can cancel scan
+
+State 5: Scan complete — ready to copy
+
+Summary cards:
+
+Total files: N (X photos, Y videos)
+To copy: N files (X GB)
+Already backed up (skip): N files
+Estimated time: ~X minutes at current speed
+
+
+Option to filter: All / Photos only / Videos only
+"Start Backup" button (large, primary)
+"Preview file list" expandable section
+
+State 6: Copying — live progress
+
+Overall progress: large circular/arc progress indicator with % and files count
+Speed: X MB/s (current) | X MB/s (average)
+ETA: "About 4 minutes remaining"
+Currently copying: up to 3 animated file rows (one per worker) with individual progress bars
+Completed count vs total
+Pause button, Cancel button
+Recent completions list (scrolling)
+
+State 7: Completed
+
+Success animation (subtle, not cheesy)
+Stats: X files copied, X skipped, X GB transferred, time taken
+X files failed (if any) with "View failed" and "Retry failed" buttons
+"Start new backup" button
+Option to "Eject iPhone" and "Eject SSD"
+
+State 8: Paused
+
+Progress frozen in place
+"Paused" badge pulsing
+Resume button prominent
+Reason for pause shown (user-initiated / cable disconnected / disk full)
+
+
+DESIGN SYSTEM TOKENS
+css:root {
+  /* Backgrounds */
+  --bg-base: #0f0f0f;
+  --bg-surface: #1a1a1a;
+  --bg-elevated: #222222;
+  --bg-overlay: #2a2a2a;
+
+  /* Borders */
+  --border-subtle: rgba(255,255,255,0.06);
+  --border-default: rgba(255,255,255,0.10);
+  --border-strong: rgba(255,255,255,0.18);
+
+  /* Text */
+  --text-primary: #f0ede8;
+  --text-secondary: #9e9a94;
+  --text-tertiary: #5a5752;
+
+  /* Accents */
+  --accent-amber: #f59e0b;
+  --accent-amber-dim: rgba(245,158,11,0.15);
+  --accent-green: #10b981;
+  --accent-green-dim: rgba(16,185,129,0.12);
+  --accent-red: #ef4444;
+  --accent-red-dim: rgba(239,68,68,0.12);
+  --accent-blue: #3b82f6;
+
+  /* Typography */
+  --font-display: 'Syne', sans-serif;
+  --font-body: 'DM Sans', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* Radius */
+  --radius-sm: 6px;
+  --radius-md: 12px;
+  --radius-lg: 20px;
+  --radius-xl: 28px;
+
+  /* Grain overlay */
+  --grain-opacity: 0.03;
+}
+Component Patterns
+Status Badge
+Idle: grey dot
+Scanning: amber pulsing dot
+Copying: green animated dot
+Paused: amber static dot
+Error: red dot
+Done: green checkmark
+Progress Bar
+
+Thin (4px height), full width
+Background: var(--bg-overlay)
+Fill: linear animated, colour changes: amber (scanning) → green (copying) → green solid (done)
+No percentage text on bar itself — show number separately
+
+Cards
+
+Background: var(--bg-surface)
+Border: 1px var(--border-default)
+Border-radius: var(--radius-lg)
+Subtle box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset (top highlight only)
+No drop shadows (flat aesthetic)
+
+File Row (in activity log)
+[icon] filename.HEIC        [status badge]   [size]   [speed or "skipped"]
+       /DCIM/100APPLE/...   ████████░░ 80%   4.2 MB   12.4 MB/s
+
+EDGE CASES TO HANDLE
+ScenarioHandlingiPhone not trustedShow "Unlock iPhone + tap Trust" message, poll until resolvedDuplicate filenames in destinationAppend _(1), _(2) etc to dest filename, record actual dest path in DBFile on iPhone disappears during scanLog warning, skip gracefullyHEIC filesCopy as-is, no conversion (preserve originals)Live Photos (.HEIC + .MOV pair)Copy both, track as a pair in metadataVery large video files (>4GB)Stream copy (never load into memory), show individual file progressExFAT destination (SSD formatted)Works fine with stream copy, no file size limit issueAPFS destinationNative, optimalZero files on iPhoneShow "No photos or videos found" state clearlyiPhone storage at 100% during scanJust scan, don't write to iPhone, no issueDestination has read-only permissionsDetect before starting, show clear errorEXIF date corrupt or missingFallback to file modification date, then to Undated/ folderFiles with same content, different namesCopy both (don't deduplicate at this stage — future feature)Cancel mid-copyDelete partially written file, set status='cancelled', job status='cancelled'10,000+ filesScan in chunks of 500, use virtual scrolling in UI for file list
+
+FUTURE MODULES (design for extensibility now)
+The DB schema and API should be designed so these features slot in cleanly later:
+
+Face recognition — add faces table linked to files, use InsightFace or DeepFace locally
+Duplicate detection — use perceptual hash (pHash) stored in files table
+Similar photo grouping — burst detection via timestamps + SSIM score
+Best photo picker — sharpness score (Laplacian variance), exposure score
+AI captioning — BLIP-2 or LLaVA locally, store in files.ai_caption
+Search — SQLite FTS5 on EXIF data + captions + location names (reverse geocode)
+Timeline view — group by date, location, event (gap >6h = new event)
+Multi-device — schema already has device_id, just add more devices
+Multi-SSD management — storage_volumes table tracking which files are on which SSD
+Web gallery — serve thumbnails via Fastify static, React photo grid
+
+
+SETUP SCRIPT (generate this too)
+Create scripts/setup-mac.sh:
+bash#!/bin/bash
+# VaultSync Mac Setup
+
+echo "🔍 Checking prerequisites..."
+
+# Check Homebrew
+if ! command -v brew &> /dev/null; then
+  echo "❌ Homebrew not found. Install from https://brew.sh"
+  exit 1
+fi
+
+# Install macFUSE
+if ! system_profiler SPExtensionsDataType 2>/dev/null | grep -q "macFUSE"; then
+  echo "📦 Installing macFUSE..."
+  brew install --cask macfuse
+  echo "⚠️  macFUSE installed. You may need to restart and allow it in System Settings > Privacy & Security"
+fi
+
+# Install libimobiledevice and ifuse
+if ! command -v ifuse &> /dev/null; then
+  echo "📦 Installing ifuse + libimobiledevice..."
+  brew install ifuse libimobiledevice
+fi
+
+# Verify
+echo ""
+echo "✅ Setup complete. Verification:"
+echo "   ifuse: $(which ifuse)"
+echo "   ideviceinfo: $(which ideviceinfo)"
+echo "   idevice_id: $(which idevice_id)"
+echo ""
+echo "Now start the app: npm run dev"
+
+IMPLEMENTATION ORDER
+Build in this exact order to have something working at each stage:
+
+Backend skeleton — Fastify server + WebSocket + SQLite init
+iPhone detection — idevice_id polling + WebSocket events
+Mount/unmount — ifuse wrapper + error handling
+SSD detection — diskutil parsing
+Folder browser API — folder listing endpoint
+Database schema — all tables + migrations
+Scan engine — walk DCIM, populate files table
+Skip logic — cross-reference with copy_records
+Copy engine — streaming copy + checksum + progress events
+Interruption handling — pause/resume/disconnect recovery
+Frontend skeleton — React + Zustand + WebSocket hook
+Device/disk cards — left panel
+Folder picker — breadcrumb folder browser
+Scan UI — animated scanning state
+Progress UI — live copying state with per-file rows
+Completion UI — summary + stats
+Settings page — concurrency, naming, filters
+Job history — past backups list
+Polish — animations, grain, typography, micro-interactions
+
+
+WHAT TO SAY WHEN STARTING WITH AN AI EDITOR
+Paste this entire prompt, then add:
+
+"Start with Step 1–4 of the implementation order. Create the full file structure, install dependencies (package.json with all listed packages), implement the Fastify server with WebSocket support, the SQLite database initialization with all schema tables, the idevice_id polling service, and the ifuse mount/unmount service with all error cases handled. Use TypeScript throughout. Include proper error types and logging with pino."
+
+Then iterate step by step.

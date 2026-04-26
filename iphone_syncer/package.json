@@ -1,0 +1,22 @@
+{
+  "name": "iphone-syncer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local iPhone backup manager — copy photos/videos from iPhone to external SSD",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:server": "cd server && npm run dev",
+    "dev:client": "cd client && npm run dev",
+    "build": "npm run build:server && npm run build:client",
+    "build:server": "cd server && npm run build",
+    "build:client": "cd client && npm run build",
+    "setup": "bash scripts/setup-mac.sh"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
+  
